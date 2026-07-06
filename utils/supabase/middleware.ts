@@ -2,69 +2,119 @@ import { createServerClient, type CookieOptions } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function updateSession(request: NextRequest) {
-  let supabaseResponse = NextResponse.next({
-    request,
+  // Create response first
+  const response = NextResponse.next({
+    request: {
+      headers: request.headers,
+    },
   })
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
-  if (!url || !key) {
-    return supabaseResponse
+  // If no credentials, return early (for build time)
+  if (!supabaseUrl || !supabaseKey) {
+    return response
   }
 
-  const supabase = createServerClient(
-    url,
-    key,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet: { name: string; value: string; options?: CookieOptions }[]) {
-          cookiesToSet.forEach(({ name, value }) => {
-            request.cookies.set(name, value)
-            supabaseResponse.cookies.set(name, value)
-          })
-        },
+  // Create Supabase client
+  const supabase = createServerClient(supabaseUrl, supabaseKey, {
+    cookies: {
+      getAll() {
+        return request.cookies.getAll()
       },
-    }
-  )
+      setAll(cookiesToSet: { name: string; value: string; options?: CookieOptions }[]) {
+        // Set cookies on request for subsequent operations
+        cookiesToSet.forEach(({ name, value }) => {
+          request.cookies.set(name, value)
+        })
+        // Set cookies on response
+        cookiesToSet.forEach(({ name, value, options }) => {
+          response.cookies.set(name, value, {
+            ...options,
+            path: '/',
+            sameSite: 'lax',
+            secure: process.env.NODE_ENV === 'production',
+          })
+        })
+      },
+    },
+  })
 
-  // Do not run code between createServerClient and
-  // supabase.auth.getUser(). A simple mistake could make it
-  // very hard to debug issues with time traveling or deadlocks.
-
+  // Get user - this refreshes the session if needed
   const {
     data: { user },
   } = await supabase.auth.getUser()
 
-  // Protected routes - require authentication
-  const protectedPaths = ['/dashboard', '/settings', '/profile', '/admin']
-  const isProtectedPath = protectedPaths.some(path =>
-    request.nextUrl.pathname.startsWith(path)
+  // Define route types
+  const pathname = request.nextUrl.pathname
+
+  // Public routes (no auth required)
+  const publicRoutes = [
+    '/',
+    '/login',
+    '/register',
+    '/forgot-password',
+    '/reset-password',
+    '/features',
+    '/pricing',
+    '/about',
+    '/contact',
+    '/faq',
+    '/blog',
+    '/docs',
+    '/privacy',
+    '/terms',
+  ]
+
+  // Protected routes (auth required)
+  const protectedRoutes = ['/dashboard', '/settings', '/profile', '/admin']
+
+  // Check route type
+  const isPublicRoute = publicRoutes.some(
+    (route) => pathname === route || pathname.startsWith(route + '/')
   )
 
-  // Auth routes - redirect if already logged in
-  const authRoutes = ['/login', '/register', '/forgot-password']
-  const isAuthRoute = authRoutes.some(path =>
-    request.nextUrl.pathname === path
+  const isProtectedRoute = protectedRoutes.some((route) =>
+    pathname.startsWith(route)
   )
 
-  if (isProtectedPath && !user) {
-    // Redirect to login if accessing protected route without auth
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    url.searchParams.set('redirectTo', request.nextUrl.pathname)
-    return NextResponse.redirect(url)
+  const isAuthRoute = ['/login', '/register', '/forgot-password'].includes(
+    pathname
+  )
+
+  const isApiRoute = pathname.startsWith('/api/')
+
+  // Redirect unauthenticated users from protected routes
+  if (isProtectedRoute && !user) {
+    const redirectUrl = request.nextUrl.clone()
+    redirectUrl.pathname = '/login'
+    redirectUrl.searchParams.set('redirectTo', pathname)
+    return NextResponse.redirect(redirectUrl)
   }
 
+  // Redirect authenticated users from auth routes
   if (isAuthRoute && user) {
-    // Redirect to dashboard if accessing auth routes while logged in
-    const url = request.nextUrl.clone()
-    url.pathname = '/dashboard'
-    return NextResponse.redirect(url)
+    const redirectUrl = request.nextUrl.clone()
+    redirectUrl.pathname = '/dashboard'
+    return NextResponse.redirect(redirectUrl)
   }
 
-  return supabaseResponse
+  // API routes: return 401 for unauthenticated (not redirect)
+  if (isApiRoute && !isPublicRoute && !user) {
+    // Allow public API routes
+    const publicApiPrefixes = [
+      '/api/auth/login',
+      '/api/auth/register',
+      '/api/auth/forgot-password',
+      '/api/auth/callback',
+      '/api/health',
+    ]
+
+    if (!publicApiPrefixes.some((prefix) => pathname.startsWith(prefix))) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+  }
+
+  return response
 }
